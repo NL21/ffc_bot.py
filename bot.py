@@ -377,7 +377,7 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     monitor.log_command('stats', user.id)
     
     # Проверка админа (вставьте свой ID Telegram)
-    ADMIN_IDS = [123456789]  # Замените на ваш ID
+    ADMIN_IDS = [177060946]  # Замените на ваш ID
     
     if user.id not in ADMIN_IDS:
         await update.message.reply_text(
