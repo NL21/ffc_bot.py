@@ -1,10 +1,9 @@
 """
-ПОЛНЫЙ КОД ТЕЛЕГРАМ-БОТА FFC.TEAM ДЛЯ RAILWAY
+ПОЛНЫЙ КОД ТЕЛЕГРАМ-БОТА FFC.TEAM ДЛЯ RAILWAY (ИСПРАВЛЕННАЯ ВЕРСИЯ)
 """
 
 import os
 import logging
-import asyncio
 from datetime import datetime, timedelta
 from typing import Dict, List, Set
 
@@ -22,7 +21,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ============================================
-# 2. КЛАСС ПАРСЕРА (БЕЗ ИЗМЕНЕНИЙ, РАБОТАЕТ ИДЕАЛЬНО)
+# 2. КЛАСС ПАРСЕРА
 # ============================================
 class FFCBotManager:
     def __init__(self):
@@ -198,14 +197,13 @@ class FFCBotManager:
 # 3. СОЗДАЕМ ПАРСЕР И ПОЛУЧАЕМ ТОКЕН
 # ============================================
 parser = FFCBotManager()
-TOKEN = os.environ.get("BOT_TOKEN")  # Берем токен из переменных Railway
+TOKEN = os.environ.get("BOT_TOKEN")
 
 # ============================================
-# 4. ФУНКЦИИ-ОБРАБОТЧИКИ КОМАНД ДЛЯ ТЕЛЕГРАМ
+# 4. ФУНКЦИИ-ОБРАБОТЧИКИ КОМАНД
 # ============================================
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик команды /start"""
     user = update.effective_user
     await update.message.reply_text(
         f"Привет, {user.first_name}! 👋\n\n"
@@ -219,7 +217,6 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def venues_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик команды /venues"""
     text = "🏟️ *ДОСТУПНЫЕ ПЛОЩАДКИ:*\n\n"
     for venue in parser.venues.values():
         text += f"• {venue['name']}\n"
@@ -227,7 +224,6 @@ async def venues_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text, parse_mode='Markdown')
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик команды /help"""
     text = (
         "🆘 *Помощь*\n\n"
         "*/slots* - основной поиск слотов на 2 недели вперед\n"
@@ -240,8 +236,6 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text, parse_mode='Markdown')
 
 async def slots_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик команды /slots - ОСНОВНАЯ ФУНКЦИЯ"""
-    # Отправляем сообщение о начале поиска
     message = await update.message.reply_text(
         "🔍 *Ищу свободные слоты...*\n\n"
         "Проверяю доступность на 2 недели вперед. Это займет ~10 секунд ⏳",
@@ -249,10 +243,8 @@ async def slots_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     
     try:
-        # Получаем слоты
         results = parser.get_all_slots()
         
-        # Форматируем результат
         if not results:
             output = "❌ Не удалось получить данные."
         else:
@@ -284,23 +276,19 @@ async def slots_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 footer = "\n📝 _Примечание: В будни показываются только слоты с 18:30 и позже._"
                 output = header + "="*40 + "\n".join(messages) + footer
         
-        # Отправляем результат
         await message.edit_text(output, parse_mode='Markdown')
         
     except Exception as e:
         logger.error(f"Ошибка в slots_command: {e}")
-        error_text = (
-            "❌ *Произошла ошибка*\n\n"
-            "Попробуйте еще раз через пару минут."
-        )
+        error_text = "❌ *Произошла ошибка*\n\nПопробуйте еще раз через пару минут."
         await message.edit_text(error_text, parse_mode='Markdown')
 
 # ============================================
-# 5. ОСНОВНОЙ ЗАПУСК БОТА (САМАЯ ВАЖНАЯ ЧАСТЬ!)
+# 5. ОСНОВНОЙ ЗАПУСК БОТА (ИСПРАВЛЕННАЯ ВЕРСИЯ!)
 # ============================================
 
-async def main():
-    """Основная функция запуска бота"""
+def main():
+    """Основная функция запуска бота - без asyncio.run()"""
     if not TOKEN:
         logger.error("❌ Токен бота не найден! Проверьте переменную BOT_TOKEN в Railway.")
         return
@@ -314,7 +302,7 @@ async def main():
     application.add_handler(CommandHandler("venues", venues_command))
     application.add_handler(CommandHandler("help", help_command))
     
-    # 3. УСТАНАВЛИВАЕМ МЕНЮ КОМАНД В ТЕЛЕГРАМ
+    # 3. УСТАНАВЛИВАЕМ МЕНЮ КОМАНД В ТЕЛЕГРАМ (асинхронная функция)
     async def set_commands(app):
         await app.bot.set_my_commands([
             ("start", "Запустить бота"),
@@ -326,17 +314,17 @@ async def main():
     
     application.post_init = set_commands
     
-    # 4. ЗАПУСКАЕМ БОТА
+    # 4. ЗАПУСКАЕМ БОТА (БЕЗ asyncio.run - это ключевое исправление!)
     logger.info("=" * 50)
     logger.info("🤖 БОТ FFC ЗАПУЩЕН НА RAILWAY!")
     logger.info("=" * 50)
     
-    # ЭТО ГЛАВНАЯ СТРОКА - БОТ НАЧИНАЕТ РАБОТАТЬ И ЖДЕТ КОМАНД
-    await application.run_polling()
+    # ЗАПУСК ПОЛЛИНГА - БОТ БУДЕТ РАБОТАТЬ ПОСТОЯННО
+    application.run_polling()
 
 # ============================================
 # 6. ТОЧКА ВХОДА - ЗАПУСК ПРОГРАММЫ
 # ============================================
 if __name__ == "__main__":
-    # Запускаем основную функцию
-    asyncio.run(main())
+    # ГЛАВНОЕ ИСПРАВЛЕНИЕ: запускаем main() как обычную функцию
+    main()
