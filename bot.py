@@ -10,6 +10,7 @@ from typing import Dict, List, Set
 import requests
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram.error import Conflict
 
 # ============================================
 # 1. НАСТРОЙКА ЛОГИРОВАНИЯ
@@ -284,11 +285,11 @@ async def slots_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await message.edit_text(error_text, parse_mode='Markdown')
 
 # ============================================
-# 5. ОСНОВНОЙ ЗАПУСК БОТА (ИСПРАВЛЕННАЯ ВЕРСИЯ!)
+# 5. ОСНОВНОЙ ЗАПУСК БОТА (С ОБРАБОТКОЙ КОНФЛИКТОВ)
 # ============================================
 
 def main():
-    """Основная функция запуска бота - без asyncio.run()"""
+    """Основная функция запуска бота - с обработкой конфликтов"""
     if not TOKEN:
         logger.error("❌ Токен бота не найден! Проверьте переменную BOT_TOKEN в Railway.")
         return
@@ -302,7 +303,7 @@ def main():
     application.add_handler(CommandHandler("venues", venues_command))
     application.add_handler(CommandHandler("help", help_command))
     
-    # 3. УСТАНАВЛИВАЕМ МЕНЮ КОМАНД В ТЕЛЕГРАМ (асинхронная функция)
+    # 3. УСТАНАВЛИВАЕМ МЕНЮ КОМАНД
     async def set_commands(app):
         await app.bot.set_my_commands([
             ("start", "Запустить бота"),
@@ -314,13 +315,28 @@ def main():
     
     application.post_init = set_commands
     
-    # 4. ЗАПУСКАЕМ БОТА (БЕЗ asyncio.run - это ключевое исправление!)
+    # 4. ЗАПУСКАЕМ БОТА С ПОВТОРНЫМИ ПОПЫТКАМИ ПРИ КОНФЛИКТЕ
     logger.info("=" * 50)
     logger.info("🤖 БОТ FFC ЗАПУЩЕН НА RAILWAY!")
     logger.info("=" * 50)
     
-    # ЗАПУСК ПОЛЛИНГА - БОТ БУДЕТ РАБОТАТЬ ПОСТОЯННО
-    application.run_polling()
+    # Запускаем поллинг с обработкой ошибки Conflict
+    retry_count = 0
+    max_retries = 5
+    
+    while retry_count < max_retries:
+        try:
+            application.run_polling()
+        except Conflict as e:
+            retry_count += 1
+            logger.warning(f"Конфликт: другой экземпляр бота. Попытка {retry_count}/{max_retries}")
+            import time
+            time.sleep(10)  # Ждем 10 секунд
+        except Exception as e:
+            logger.error(f"Неожиданная ошибка: {e}")
+            break
+    else:
+        logger.error(f"Достигнут лимит попыток ({max_retries}). Бот остановлен.")
 
 # ============================================
 # 6. ТОЧКА ВХОДА - ЗАПУСК ПРОГРАММЫ
