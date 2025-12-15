@@ -1,30 +1,28 @@
 """
-ПОЛНЫЙ КОД ТЕЛЕГРАМ-БОТА FFC.TEAM ДЛЯ RAILWAY (ИСПРАВЛЕННАЯ ВЕРСИЯ)
+🤖 ТЕЛЕГРАМ-БОТ ДЛЯ ПОИСКА СЛОТОВ FFC.TEAM
+Версия 2.0 - Работает 24/7 на Railway
 """
 
 import os
 import logging
+import asyncio
 from datetime import datetime, timedelta
 from typing import Dict, List, Set
 
 import requests
 from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
 from telegram.error import Conflict
+from telegram.ext import Application, CommandHandler, ContextTypes
 
-# ============================================
-# 1. НАСТРОЙКА ЛОГИРОВАНИЯ
-# ============================================
+# ===================== НАСТРОЙКА ЛОГИРОВАНИЯ =====================
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-# ============================================
-# 2. КЛАСС ПАРСЕРА
-# ============================================
-class FFCBotManager:
+# ===================== КЛАСС ПАРСЕРА FFC =====================
+class FFCParser:
     def __init__(self):
         self.headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
@@ -41,58 +39,67 @@ class FFCBotManager:
             },
         }
 
-    def get_period(self):
+    def get_search_period(self):
+        """Рассчитываем период: сегодня + следующая неделя"""
         today = datetime.now()
-        weekday = today.weekday()
-        days_to_sunday = 6 - weekday
-        total_days = days_to_sunday + 7
+        days_to_weekend = 6 - today.weekday()  # дней до воскресенья
+        total_days = days_to_weekend + 7      # + следующая неделя
         return today, total_days
 
-    def fetch_raw_slots(self, venue_id: str, date_str: str):
-        api_url = f"https://api.vivacrm.ru/end-user/api/v1/iSkq6G/products/master-services/{venue_id}/timeslots"
+    def fetch_slots_from_api(self, venue_id: str, date_str: str):
+        """Получаем слоты с API FFC"""
+        url = f"https://api.vivacrm.ru/end-user/api/v1/iSkq6G/products/master-services/{venue_id}/timeslots"
         payload = {"date": date_str, "trainers": {"type": "NO_TRAINER"}}
         
         try:
-            response = requests.post(api_url, json=payload, headers=self.headers, timeout=10)
+            response = requests.post(url, json=payload, headers=self.headers, timeout=10)
             data = response.json()
             return data.get("byTrainer", {}).get("NO_TRAINER", {}).get("slots", [])
         except Exception as e:
-            logger.error(f"Ошибка для {date_str}: {e}")
+            logger.error(f"Ошибка API для {date_str}: {e}")
             return []
 
-    def parse_slots(self, venue_id: str):
-        start_date, total_days = self.get_period()
-        all_raw_slots = []
+    def parse_duration(self, duration_str: str) -> int:
+        """Преобразуем PT1H30M в минуты"""
+        if not duration_str or not duration_str.startswith('PT'):
+            return 30
         
+        duration_str = duration_str[2:]  # Убираем 'PT'
+        minutes = 0
+        
+        if 'H' in duration_str:
+            hours_part, duration_str = duration_str.split('H')
+            minutes += int(hours_part) * 60
+        
+        if 'M' in duration_str:
+            minutes_part = duration_str.replace('M', '')
+            if minutes_part:
+                minutes += int(minutes_part)
+        
+        return minutes if minutes > 0 else 30
+
+    def parse_all_slots(self, venue_id: str) -> List[Dict]:
+        """Основной метод парсинга слотов"""
+        start_date, total_days = self.get_search_period()
+        all_slots = []
+        
+        # Собираем данные за весь период
         for day_offset in range(total_days + 1):
             current_date = start_date + timedelta(days=day_offset)
             date_str = current_date.strftime("%Y-%m-%d")
-            raw_slots = self.fetch_raw_slots(venue_id, date_str)
+            raw_slots = self.fetch_slots_from_api(venue_id, date_str)
             
             for slot_group in raw_slots:
                 for slot in slot_group:
                     try:
                         time_from = slot.get("timeFrom", "")
                         time_to = slot.get("timeTo", "")
-                        available_duration = slot.get("availableDuration", "PT30M")
+                        duration = slot.get("availableDuration", "PT30M")
                         
                         dt_from = datetime.fromisoformat(time_from.replace('Z', '+00:00'))
                         dt_to = datetime.fromisoformat(time_to.replace('Z', '+00:00'))
                         
-                        # Преобразуем длительность
-                        duration_str = available_duration
-                        duration_minutes = 30
-                        if duration_str.startswith('PT'):
-                            duration_str = duration_str[2:]
-                            if 'H' in duration_str:
-                                hours_part, duration_str = duration_str.split('H')
-                                duration_minutes = int(hours_part) * 60
-                            if 'M' in duration_str:
-                                minutes_part = duration_str.replace('M', '')
-                                if minutes_part:
-                                    duration_minutes += int(minutes_part)
-                        
-                        all_raw_slots.append({
+                        all_slots.append({
                             'datetime': dt_from,
                             'date': dt_from.strftime("%d.%m.%Y"),
                             'weekday': ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"][dt_from.weekday()],
@@ -102,32 +109,32 @@ class FFCBotManager:
                             'time': f"{dt_from.strftime('%H:%M')}-{dt_to.strftime('%H:%M')}",
                             'room': slot.get("roomName", ""),
                             'price': slot.get("price", {}).get("from", 0),
-                            'duration_minutes': duration_minutes,
+                            'duration_minutes': self.parse_duration(duration),
                             'unique_key': f"{dt_from.strftime('%Y%m%d%H%M')}"
                         })
-                    except Exception:
+                    except Exception as e:
                         continue
         
-        return self.smart_filter_slots(all_raw_slots)
+        return self.filter_slots_intelligently(all_slots)
 
-    def smart_filter_slots(self, slots: List[Dict]):
+    def filter_slots_intelligently(self, slots: List[Dict]) -> List[Dict]:
+        """Умная фильтрация слотов по правилам FFC"""
         if not slots:
             return []
         
-        # Убираем дубликаты
+        # 1. Убираем дубликаты
         unique_slots = []
         seen_keys: Set[str] = set()
-        
         for slot in slots:
             key = slot['unique_key']
             if key not in seen_keys:
                 seen_keys.add(key)
                 unique_slots.append(slot)
         
-        # Сортируем
+        # 2. Сортируем по дате и времени
         unique_slots.sort(key=lambda x: (x['date'], x['start']))
         
-        # Фильтрация по duration
+        # 3. Фильтруем слоты с duration=PT30M после слотов с большей длительностью
         filtered_by_duration = []
         i = 0
         n = len(unique_slots)
@@ -135,54 +142,48 @@ class FFCBotManager:
         while i < n:
             current_slot = unique_slots[i]
             
+            # Пропускаем слоты, которые являются продолжением предыдущего
             if i + 1 < n:
                 next_slot = unique_slots[i + 1]
-                
                 if (next_slot['date'] == current_slot['date'] and 
-                    next_slot['start'] == current_slot['end']):
-                    
-                    if (current_slot['duration_minutes'] > 30 and 
-                        next_slot['duration_minutes'] == 30):
-                        i += 1
+                    next_slot['start'] == current_slot['end'] and
+                    current_slot['duration_minutes'] > 30 and 
+                    next_slot['duration_minutes'] == 30):
+                    i += 1  # Пропускаем следующий слот
             
             filtered_by_duration.append(current_slot)
             i += 1
         
-        # Фильтрация по времени (будни/выходные)
+        # 4. Фильтрация по времени: будни с 18:30, выходные все
         final_slots = []
         for slot in filtered_by_duration:
-            is_weekday = slot['weekday_num'] < 5
+            is_weekday = slot['weekday_num'] < 5  # Пн-Пт
             
             if is_weekday:
+                # Проверяем, чтобы слот начинался не раньше 18:30
                 hours, minutes = map(int, slot['start'].split(':'))
                 total_minutes = hours * 60 + minutes
-                
-                if total_minutes >= 1110:  # 18:30 или позже
+                if total_minutes >= 1110:  # 18:30 = 1110 минут
                     final_slots.append(slot)
-                else:
-                    continue
             else:
+                # Выходные - все слоты
                 final_slots.append(slot)
         
-        # Форматируем результат
-        result = []
-        for slot in final_slots:
-            result.append({
-                'date': slot['date'],
-                'weekday': slot['weekday'],
-                'time': slot['time'],
-                'room': slot['room'],
-                'price': f"{int(slot['price']):,} руб.".replace(',', ' ')
-            })
-        
-        return result
+        # 5. Форматируем результат
+        return [{
+            'date': slot['date'],
+            'weekday': slot['weekday'],
+            'time': slot['time'],
+            'price': f"{int(slot['price']):,} руб.".replace(',', ' ')
+        } for slot in final_slots]
 
-    def get_all_slots(self):
+    def get_all_venues_slots(self) -> Dict:
+        """Получаем слоты для всех площадок"""
         results = {}
         
         for venue_key, venue_info in self.venues.items():
             try:
-                slots = self.parse_slots(venue_info['id'])
+                slots = self.parse_all_slots(venue_info['id'])
                 results[venue_key] = {
                     'name': venue_info['name'],
                     'slots': slots,
@@ -194,62 +195,72 @@ class FFCBotManager:
         
         return results
 
-# ============================================
-# 3. СОЗДАЕМ ПАРСЕР И ПОЛУЧАЕМ ТОКЕН
-# ============================================
-parser = FFCBotManager()
-TOKEN = os.environ.get("BOT_TOKEN")
+# ===================== СОЗДАЕМ ПАРСЕР =====================
+parser = FFCParser()
+TOKEN = os.environ.get("BOT_TOKEN")  # Токен берется из Railway Variables
 
-# ============================================
-# 4. ФУНКЦИИ-ОБРАБОТЧИКИ КОМАНД
-# ============================================
+# ===================== КОМАНДЫ ТЕЛЕГРАМ-БОТА =====================
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик команды /start"""
     user = update.effective_user
-    await update.message.reply_text(
+    welcome_text = (
         f"Привет, {user.first_name}! 👋\n\n"
-        "Я бот для поиска свободных футбольных слотов FFC.Team.\n\n"
+        "⚽ *Я — бот для поиска свободных футбольных слотов на FFC.Team*\n\n"
         "📋 *Доступные команды:*\n"
-        "/slots - Найти свободные слоты\n"
-        "/venues - Список площадок\n"
-        "/help - Помощь\n\n"
-        "⚙️ *Фильтрация:* В будни показываю только слоты с 18:30.",
-        parse_mode='Markdown'
+        "• /slots — найти свободные слоты\n"
+        "• /venues — список площадок\n"
+        "• /help — помощь\n\n"
+        "⚙️ *Автофильтрация:*\n"
+        "• Будни (Пн-Пт) — только слоты с 18:30\n"
+        "• Выходные — все доступные слоты\n\n"
+        "Жми /slots чтобы начать поиск! 🎯"
     )
+    await update.message.reply_text(welcome_text, parse_mode='Markdown')
 
 async def venues_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик команды /venues"""
     text = "🏟️ *ДОСТУПНЫЕ ПЛОЩАДКИ:*\n\n"
     for venue in parser.venues.values():
         text += f"• {venue['name']}\n"
-    text += "\nИспользуйте /slots для поиска слотов."
+    text += "\n🔍 Используйте /slots для поиска слотов."
     await update.message.reply_text(text, parse_mode='Markdown')
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик команды /help"""
     text = (
-        "🆘 *Помощь*\n\n"
-        "*/slots* - основной поиск слотов на 2 недели вперед\n"
-        "*/venues* - список всех площадок\n"
-        "*/start* - это сообщение\n\n"
-        "Бот автоматически фильтрует слоты:\n"
-        "• Будни (пн-пт): только с 18:30\n"
-        "• Выходные: все доступные слоты"
+        "🆘 *ПОМОЩЬ*\n\n"
+        "*/slots* — основной поиск слотов на 2 недели вперед\n"
+        "*/venues* — список всех площадок\n"
+        "*/start* — это сообщение\n\n"
+        "📊 *Как это работает:*\n"
+        "1. Бот проверяет доступность слотов на 2 недели\n"
+        "2. В будни показывает только слоты с 18:30\n"
+        "3. В выходные показывает все свободные слоты\n"
+        "4. Данные обновляются в реальном времени\n\n"
+        "❓ Есть вопросы? Обращайтесь к разработчику!"
     )
     await update.message.reply_text(text, parse_mode='Markdown')
 
 async def slots_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик команды /slots — ГЛАВНАЯ ФУНКЦИЯ"""
+    # Отправляем сообщение о начале поиска
     message = await update.message.reply_text(
-        "🔍 *Ищу свободные слоты...*\n\n"
-        "Проверяю доступность на 2 недели вперед. Это займет ~10 секунд ⏳",
+        "🔍 *Ищу свободные слоты...*\n"
+        "_Проверяю доступность на 2 недели вперед. Это займет ~10 секунд ⏳_",
         parse_mode='Markdown'
     )
     
     try:
-        results = parser.get_all_slots()
+        # Получаем все слоты
+        results = parser.get_all_venues_slots()
         
         if not results:
-            output = "❌ Не удалось получить данные."
+            output = "❌ *Не удалось получить данные от сервера FFC.*"
         else:
             messages = []
+            total_slots_found = 0
+            
             for venue_data in results.values():
                 slots = venue_data['slots']
                 if not slots:
@@ -257,90 +268,110 @@ async def slots_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 
                 venue_msg = f"🏟️ *{venue_data['name']}*\n"
                 current_date = None
-                slot_count = 0
                 
                 for slot in slots:
                     if slot['date'] != current_date:
                         current_date = slot['date']
                         venue_msg += f"\n📅 *{current_date}* ({slot['weekday']}):\n"
                     
-                    venue_msg += f"• {slot['time']} - {slot['price']}\n"
-                    slot_count += 1
+                    venue_msg += f"• {slot['time']} — {slot['price']}\n"
+                    total_slots_found += 1
                 
-                venue_msg += f"\nВсего: {slot_count} слотов\n"
+                venue_msg += f"\nВсего: {len(slots)} слотов\n"
                 messages.append(venue_msg)
             
             if not messages:
-                output = "🎯 На ближайшие 2 недели свободных слотов не найдено."
+                output = (
+                    "🎯 *На ближайшие 2 недели свободных слотов не найдено.*\n\n"
+                    "_Попробуйте изменить параметры поиска или проверьте позже._"
+                )
             else:
-                header = "⚽ *СВОБОДНЫЕ СЛОТЫ FFC.TEAM*\n\n"
+                header = f"⚽ *СВОБОДНЫЕ СЛОТЫ FFC.TEAM*\n_Найдено {total_slots_found} слотов_\n\n"
                 footer = "\n📝 _Примечание: В будни показываются только слоты с 18:30 и позже._"
                 output = header + "="*40 + "\n".join(messages) + footer
         
+        # Редактируем сообщение с результатами
         await message.edit_text(output, parse_mode='Markdown')
         
     except Exception as e:
-        logger.error(f"Ошибка в slots_command: {e}")
-        error_text = "❌ *Произошла ошибка*\n\nПопробуйте еще раз через пару минут."
+        logger.error(f"Критическая ошибка в slots_command: {e}")
+        error_text = (
+            "❌ *Произошла непредвиденная ошибка*\n\n"
+            "Пожалуйста, попробуйте еще раз через пару минут.\n"
+            "Если ошибка повторяется — свяжитесь с разработчиком."
+        )
         await message.edit_text(error_text, parse_mode='Markdown')
 
-# ============================================
-# 5. ОСНОВНОЙ ЗАПУСК БОТА (С ОБРАБОТКОЙ КОНФЛИКТОВ)
-# ============================================
+# ===================== ЗАПУСК БОТА =====================
+
+async def setup_bot_commands(application):
+    """Устанавливаем меню команд в Telegram"""
+    await application.bot.set_my_commands([
+        ("start", "Запустить бота"),
+        ("slots", "Найти свободные слоты ⭐"),
+        ("venues", "Список площадок"),
+        ("help", "Помощь по использованию"),
+    ])
+    logger.info("✅ Меню команд Telegram установлено")
 
 def main():
-    """Основная функция запуска бота - с обработкой конфликтов"""
+    """Главная функция запуска бота"""
+    # Проверяем токен
     if not TOKEN:
-        logger.error("❌ Токен бота не найден! Проверьте переменную BOT_TOKEN в Railway.")
+        logger.error("❌ ОШИБКА: Токен бота не найден!")
+        logger.error("Добавьте переменную BOT_TOKEN в Railway → Variables")
         return
     
-    # 1. СОЗДАЕМ ПРИЛОЖЕНИЕ
-    application = Application.builder().token(TOKEN).build()
+    logger.info("=" * 60)
+    logger.info("🚀 ЗАПУСК БОТА FFC НА RAILWAY")
+    logger.info(f"🤖 Токен: {TOKEN[:10]}...{TOKEN[-10:]}")
+    logger.info("=" * 60)
     
-    # 2. РЕГИСТРИРУЕМ КОМАНДЫ
-    application.add_handler(CommandHandler("start", start_command))
-    application.add_handler(CommandHandler("slots", slots_command))
-    application.add_handler(CommandHandler("venues", venues_command))
-    application.add_handler(CommandHandler("help", help_command))
+    # Создаем приложение с обработкой конфликтов
+    async def post_init(app):
+        # КРИТИЧЕСКИ ВАЖНО: сбрасываем все старые соединения
+        await app.bot.delete_webhook(drop_pending_updates=True)
+        await setup_bot_commands(app)
+        logger.info("✅ Конфликты сброшены, бот готов к работе")
     
-    # 3. УСТАНАВЛИВАЕМ МЕНЮ КОМАНД
-    async def set_commands(app):
-        await app.bot.set_my_commands([
-            ("start", "Запустить бота"),
-            ("slots", "Найти свободные слоты ⭐"),
-            ("venues", "Список площадок"),
-            ("help", "Помощь"),
-        ])
-        logger.info("✅ Меню команд установлено")
-    
-    application.post_init = set_commands
-    
-    # 4. ЗАПУСКАЕМ БОТА С ПОВТОРНЫМИ ПОПЫТКАМИ ПРИ КОНФЛИКТЕ
-    logger.info("=" * 50)
-    logger.info("🤖 БОТ FFC ЗАПУЩЕН НА RAILWAY!")
-    logger.info("=" * 50)
-    
-    # Запускаем поллинг с обработкой ошибки Conflict
-    retry_count = 0
-    max_retries = 5
-    
-    while retry_count < max_retries:
-        try:
-            application.run_polling()
-        except Conflict as e:
-            retry_count += 1
-            logger.warning(f"Конфликт: другой экземпляр бота. Попытка {retry_count}/{max_retries}")
-            import time
-            time.sleep(10)  # Ждем 10 секунд
-        except Exception as e:
-            logger.error(f"Неожиданная ошибка: {e}")
-            break
-    else:
-        logger.error(f"Достигнут лимит попыток ({max_retries}). Бот остановлен.")
+    try:
+        # Создаем и настраиваем приложение
+        application = Application.builder() \
+            .token(TOKEN) \
+            .post_init(post_init) \
+            .build()
+        
+        # Регистрируем обработчики команд
+        application.add_handler(CommandHandler("start", start_command))
+        application.add_handler(CommandHandler("slots", slots_command))
+        application.add_handler(CommandHandler("venues", venues_command))
+        application.add_handler(CommandHandler("help", help_command))
+        
+        # Запускаем бота в режиме постоянного опроса
+        logger.info("✅ Бот запущен и ожидает команд...")
+        logger.info("👉 Напишите /start боту в Telegram")
+        
+        application.run_polling(
+            allowed_updates=Update.ALL_TYPES,
+            close_loop=False
+        )
+        
+    except Conflict as e:
+        logger.error(f"🚨 КОНФЛИКТ: Запущено несколько ботов одновременно")
+        logger.error("Решение: Подождите 2 минуты или перезапустите в Railway")
+        logger.error(f"Детали: {e}")
+    except Exception as e:
+        logger.error(f"🚨 КРИТИЧЕСКАЯ ОШИБКА: {type(e).__name__}: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
 
-# ============================================
-# 6. ТОЧКА ВХОДА - ЗАПУСК ПРОГРАММЫ
-# ============================================
+# ===================== ТОЧКА ВХОДА =====================
 if __name__ == "__main__":
-    # ГЛАВНОЕ ИСПРАВЛЕНИЕ: запускаем main() как обычную функцию
+    # Проверяем, что мы на Railway (или локально для теста)
+    if "RAILWAY_ENVIRONMENT" in os.environ:
+        logger.info("🌐 Среда: Railway (продакшн)")
+    else:
+        logger.info("💻 Среда: Локальная (разработка)")
+    
+    # Запускаем бота
     main()
