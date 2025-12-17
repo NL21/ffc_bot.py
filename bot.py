@@ -1,15 +1,13 @@
 """
 🤖 ТЕЛЕГРАМ-БОТ ДЛЯ ПОИСКА СЛОТОВ FFC.TEAM
-Версия 3.0 - С кэшированием и авто-паузой
+Версия 3.0 - С улучшенной фильтрацией и корректным временем
 """
 
 import os
 import logging
-import asyncio
-import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Set
-from collections import defaultdict
+import pytz  # Добавляем для работы с часовыми поясами
 
 import requests
 from telegram import Update
@@ -23,75 +21,23 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ===================== КОНФИГУРАЦИЯ =====================
-class Config:
-    """Конфигурация бота"""
-    
-    # Настройки кэширования (в секундах)
-    CACHE_TTL = 300  # 5 минут
-    
-    # Настройки авто-паузы (ночное время, МСК)
-    PAUSE_START_HOUR = 2   # 2:00 ночи
-    PAUSE_END_HOUR = 8     # 8:00 утра
-    
-    # Таймауты
-    REQUEST_TIMEOUT = 10
-    
-    @classmethod
-    def is_pause_time(cls):
-        """Проверяем, сейчас время авто-паузы"""
-        now_utc = datetime.utcnow()
-        # UTC+3 для Москвы
-        now_moscow = now_utc + timedelta(hours=3)
-        return cls.PAUSE_START_HOUR <= now_moscow.hour < cls.PAUSE_END_HOUR
+# ===================== КОНСТАНТЫ ФИЛЬТРАЦИИ =====================
+# Часовой пояс Москвы (UTC+3)
+MOSCOW_TZ = pytz.timezone('Europe/Moscow')
 
-# ===================== МОНИТОРИНГ И СТАТИСТИКА =====================
-class BotMonitor:
-    """Класс для сбора статистики использования бота"""
-    
-    def __init__(self):
-        self.stats = {
-            'commands': defaultdict(int),
-            'users': set(),
-            'start_time': time.time(),
-            'total_parses': 0,
-            'cache_hits': 0,
-            'pause_mode_activations': 0
-        }
-    
-    def log_command(self, command: str, user_id: int):
-        """Логируем использование команды"""
-        self.stats['commands'][command] += 1
-        self.stats['users'].add(user_id)
-    
-    def log_parse(self, cache_hit: bool = False):
-        """Логируем парсинг"""
-        self.stats['total_parses'] += 1
-        if cache_hit:
-            self.stats['cache_hits'] += 1
-    
-    def log_pause_activation(self):
-        """Логируем активацию паузы"""
-        self.stats['pause_mode_activations'] += 1
-    
-    def get_stats(self):
-        """Получаем статистику"""
-        uptime_hours = (time.time() - self.stats['start_time']) / 3600
-        
-        return {
-            'uptime_hours': round(uptime_hours, 1),
-            'total_users': len(self.stats['users']),
-            'total_commands': sum(self.stats['commands'].values()),
-            'commands_breakdown': dict(self.stats['commands']),
-            'parses': {
-                'total': self.stats['total_parses'],
-                'cache_hits': self.stats['cache_hits'],
-                'cache_hit_rate': f"{(self.stats['cache_hits'] / max(1, self.stats['total_parses'])) * 100:.1f}%"
-            },
-            'pause_activations': self.stats['pause_mode_activations']
-        }
+# График фильтрации (в минутах от начала суток)
+FILTER_RULES = {
+    'weekday': {  # Пн-Пт
+        'start_minutes': 18 * 60 + 30,  # 18:30
+        'end_minutes': 21 * 60 + 0      # 21:00
+    },
+    'weekend': {  # Сб-Вс
+        'start_minutes': 8 * 60 + 30,   # 08:30
+        'end_minutes': 21 * 60 + 30     # 21:30
+    }
+}
 
-# ===================== КЛАСС ПАРСЕРА FFC С КЭШИРОВАНИЕМ =====================
+# ===================== КЛАСС ПАРСЕРА FFC =====================
 class FFCParser:
     def __init__(self):
         self.headers = {
@@ -109,29 +55,30 @@ class FFCParser:
             },
         }
         
-        # КЭШ: храним результаты на N минут (настраивается в Config)
+        # КЭШ: храним результаты на 5 минут
         self._cache = {
             'data': None,
             'timestamp': None,
-            'ttl': Config.CACHE_TTL
+            'ttl': 300  # 5 минут в секундах
         }
-        logger.info(f"✅ Парсер инициализирован с кэшированием ({Config.CACHE_TTL//60} минут)")
+        logger.info("✅ Парсер инициализирован с кэшированием (5 минут)")
 
     def _is_cache_valid(self):
         """Проверяем, актуален ли кэш"""
         if not self._cache['data'] or not self._cache['timestamp']:
             return False
         
-        current_time = time.time()
+        from time import time
+        current_time = time()
         cache_age = current_time - self._cache['timestamp']
         
         return cache_age < self._cache['ttl']
 
     def get_search_period(self):
         """Рассчитываем период: сегодня + следующая неделя"""
-        today = datetime.now()
-        days_to_weekend = 6 - today.weekday()
-        total_days = days_to_weekend + 7
+        today = datetime.now(MOSCOW_TZ)
+        days_to_weekend = 6 - today.weekday()  # дней до воскресенья
+        total_days = days_to_weekend + 7      # + следующая неделя
         return today, total_days
 
     def fetch_slots_from_api(self, venue_id: str, date_str: str):
@@ -140,13 +87,9 @@ class FFCParser:
         payload = {"date": date_str, "trainers": {"type": "NO_TRAINER"}}
         
         try:
-            response = requests.post(url, json=payload, headers=self.headers, timeout=Config.REQUEST_TIMEOUT)
-            response.raise_for_status()
+            response = requests.post(url, json=payload, headers=self.headers, timeout=10)
             data = response.json()
             return data.get("byTrainer", {}).get("NO_TRAINER", {}).get("slots", [])
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Ошибка сети для {date_str}: {e}")
-            return []
         except Exception as e:
             logger.error(f"Ошибка API для {date_str}: {e}")
             return []
@@ -156,7 +99,7 @@ class FFCParser:
         if not duration_str or not duration_str.startswith('PT'):
             return 30
         
-        duration_str = duration_str[2:]
+        duration_str = duration_str[2:]  # Убираем 'PT'
         minutes = 0
         
         if 'H' in duration_str:
@@ -175,6 +118,7 @@ class FFCParser:
         start_date, total_days = self.get_search_period()
         all_slots = []
         
+        # Собираем данные за весь период
         for day_offset in range(total_days + 1):
             current_date = start_date + timedelta(days=day_offset)
             date_str = current_date.strftime("%Y-%m-%d")
@@ -190,21 +134,24 @@ class FFCParser:
                         dt_from = datetime.fromisoformat(time_from.replace('Z', '+00:00'))
                         dt_to = datetime.fromisoformat(time_to.replace('Z', '+00:00'))
                         
+                        # Конвертируем в московское время
+                        dt_from_moscow = dt_from.astimezone(MOSCOW_TZ)
+                        dt_to_moscow = dt_to.astimezone(MOSCOW_TZ)
+                        
                         all_slots.append({
-                            'datetime': dt_from,
-                            'date': dt_from.strftime("%d.%m.%Y"),
-                            'weekday': ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"][dt_from.weekday()],
-                            'weekday_num': dt_from.weekday(),
-                            'start': dt_from.strftime("%H:%M"),
-                            'end': dt_to.strftime("%H:%M"),
-                            'time': f"{dt_from.strftime('%H:%M')}-{dt_to.strftime('%H:%M')}",
+                            'datetime': dt_from_moscow,
+                            'date': dt_from_moscow.strftime("%d.%m.%Y"),
+                            'weekday': ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"][dt_from_moscow.weekday()],
+                            'weekday_num': dt_from_moscow.weekday(),
+                            'start': dt_from_moscow.strftime("%H:%M"),
+                            'end': dt_to_moscow.strftime("%H:%M"),
+                            'time': f"{dt_from_moscow.strftime('%H:%M')}-{dt_to_moscow.strftime('%H:%M')}",
                             'room': slot.get("roomName", ""),
                             'price': slot.get("price", {}).get("from", 0),
                             'duration_minutes': self.parse_duration(duration),
-                            'unique_key': f"{dt_from.strftime('%Y%m%d%H%M')}"
+                            'unique_key': f"{dt_from_moscow.strftime('%Y%m%d%H%M')}"
                         })
                     except Exception as e:
-                        logger.debug(f"Пропущен слот из-за ошибки: {e}")
                         continue
         
         return self.filter_slots_intelligently(all_slots)
@@ -223,7 +170,7 @@ class FFCParser:
                 seen_keys.add(key)
                 unique_slots.append(slot)
         
-        # 2. Сортируем
+        # 2. Сортируем по дате и времени
         unique_slots.sort(key=lambda x: (x['date'], x['start']))
         
         # 3. Фильтруем слоты с duration=PT30M после слотов с большей длительностью
@@ -234,28 +181,38 @@ class FFCParser:
         while i < n:
             current_slot = unique_slots[i]
             
+            # Пропускаем слоты, которые являются продолжением предыдущего
             if i + 1 < n:
                 next_slot = unique_slots[i + 1]
                 if (next_slot['date'] == current_slot['date'] and 
                     next_slot['start'] == current_slot['end'] and
                     current_slot['duration_minutes'] > 30 and 
                     next_slot['duration_minutes'] == 30):
-                    i += 1
+                    i += 1  # Пропускаем следующий слот
             
             filtered_by_duration.append(current_slot)
             i += 1
         
-        # 4. Фильтрация по времени: будни с 18:30, выходные все
+        # 4. ФИЛЬТРАЦИЯ ПО ВРЕМЕНИ НАЧАЛА И ОКОНЧАНИЯ
         final_slots = []
         for slot in filtered_by_duration:
-            is_weekday = slot['weekday_num'] < 5
+            is_weekday = slot['weekday_num'] < 5  # Пн-Пт
             
-            if is_weekday:
-                hours, minutes = map(int, slot['start'].split(':'))
-                total_minutes = hours * 60 + minutes
-                if total_minutes >= 1110:  # 18:30
-                    final_slots.append(slot)
-            else:
+            # Получаем правила фильтрации
+            rules = FILTER_RULES['weekday' if is_weekday else 'weekend']
+            
+            # Преобразуем время начала и окончания в минуты
+            start_hours, start_minutes = map(int, slot['start'].split(':'))
+            end_hours, end_minutes = map(int, slot['end'].split(':'))
+            
+            start_total_minutes = start_hours * 60 + start_minutes
+            end_total_minutes = end_hours * 60 + end_minutes
+            
+            # Проверяем по новым правилам:
+            # 1. Слот должен начинаться НЕ РАНЬШЕ start_minutes
+            # 2. Слот должен заканчиваться НЕ ПОЗЖЕ end_minutes
+            if (start_total_minutes >= rules['start_minutes'] and 
+                end_total_minutes <= rules['end_minutes']):
                 final_slots.append(slot)
         
         # 5. Форматируем результат
@@ -268,10 +225,13 @@ class FFCParser:
 
     def get_all_venues_slots(self) -> Dict:
         """Получаем слоты для всех площадок с кэшированием"""
+        from time import time
         
         # Проверяем кэш
         if self._is_cache_valid():
-            logger.info("📦 Используются кэшированные данные")
+            logger.info("📦 Используются кэшированные данные (парсинг не требуется)")
+            # Обновляем timestamp кэша для отображения актуального времени
+            self._cache['timestamp'] = time()
             return self._cache['data']
         
         logger.info("🔄 Обновление кэша: парсим данные с FFC API...")
@@ -292,58 +252,61 @@ class FFCParser:
         
         # Обновляем кэш
         self._cache['data'] = results
-        self._cache['timestamp'] = time.time()
+        self._cache['timestamp'] = time()
         
-        total_slots = sum(v['count'] for v in results.values())
-        logger.info(f"✅ Кэш обновлен. Найдено слотов: {total_slots}")
+        logger.info(f"✅ Кэш обновлен. Найдено слотов: {sum(v['count'] for v in results.values())}")
         return results
 
-# ===================== СОЗДАЕМ ПАРСЕР И МОНИТОР =====================
+    def get_cache_info(self) -> Dict:
+        """Получаем информацию о кэше для отображения в примечании"""
+        from time import time
+        current_time = time()
+        
+        if not self._cache['timestamp']:
+            return {
+                'is_fresh': False,
+                'last_update': None,
+                'is_cached': False
+            }
+        
+        cache_age = current_time - self._cache['timestamp']
+        is_fresh = cache_age < self._cache['ttl']
+        
+        # Время последнего обновления в московском часовом поясе
+        last_update_dt = datetime.fromtimestamp(self._cache['timestamp'], MOSCOW_TZ)
+        
+        return {
+            'is_fresh': is_fresh,
+            'last_update': last_update_dt.strftime("%H:%M"),
+            'is_cached': self._cache['data'] is not None,
+            'current_time': datetime.now(MOSCOW_TZ).strftime("%H:%M")
+        }
+
+# ===================== СОЗДАЕМ ПАРСЕР =====================
 parser = FFCParser()
-monitor = BotMonitor()
-TOKEN = os.environ.get("BOT_TOKEN")  # Токен берется из Railway Variables
+TOKEN = os.environ.get("BOT_TOKEN")
 
 # ===================== КОМАНДЫ ТЕЛЕГРАМ-БОТА =====================
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик команды /start"""
     user = update.effective_user
-    monitor.log_command('start', user.id)
-    
-    # Проверяем режим паузы
-    if Config.is_pause_time():
-        monitor.log_pause_activation()
-        await update.message.reply_text(
-            "😴 *Режим ночной паузы*\n\n"
-            "Сейчас ночное время (2:00-8:00 МСК).\n"
-            "Бот работает в экономном режиме.\n\n"
-            "⏰ Вернусь к полной работе в 8:00 утра!",
-            parse_mode='Markdown'
-        )
-        return
-    
     welcome_text = (
         f"Привет, {user.first_name}! 👋\n\n"
         "⚽ *Я — бот для поиска свободных футбольных слотов на FFC.Team*\n\n"
         "📋 *Доступные команды:*\n"
         "• /slots — найти свободные слоты\n"
         "• /venues — список площадок\n"
-        "• /help — помощь\n"
-        "• /stats — статистика использования (админ)\n\n"
-        "⚙️ *Авто-фильтрация:*\n"
-        "• Будни (Пн-Пт) — только слоты с 18:30\n"
-        "• Выходные — все доступные слоты\n"
-        "• Ночь (2:00-8:00) — экономный режим\n\n"
-        "📊 *Кэширование:* данные обновляются каждые 5 минут\n\n"
+        "• /help — помощь\n\n"
+        "⚙️ *Автофильтрация:*\n"
+        "• Будни (Пн-Пт) — слоты с 18:30 до 21:00\n"
+        "• Выходные — слоты с 08:30 до 21:30\n\n"
         "Жми /slots чтобы начать поиск! 🎯"
     )
     await update.message.reply_text(welcome_text, parse_mode='Markdown')
 
 async def venues_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик команды /venues"""
-    user = update.effective_user
-    monitor.log_command('venues', user.id)
-    
     text = "🏟️ *ДОСТУПНЫЕ ПЛОЩАДКИ:*\n\n"
     for venue in parser.venues.values():
         text += f"• {venue['name']}\n"
@@ -352,101 +315,39 @@ async def venues_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик команды /help"""
-    user = update.effective_user
-    monitor.log_command('help', user.id)
-    
     text = (
         "🆘 *ПОМОЩЬ*\n\n"
         "*/slots* — основной поиск слотов на 2 недели вперед\n"
         "*/venues* — список всех площадок\n"
-        "*/start* — это сообщение\n"
-        "*/stats* — статистика использования (только админ)\n\n"
+        "*/start* — это сообщение\n\n"
         "📊 *Как это работает:*\n"
         "1. Бот проверяет доступность слотов на 2 недели\n"
-        "2. В будни показывает только слоты с 18:30\n"
-        "3. В выходные показывает все свободные слоты\n"
-        "4. Данные кэшируются на 5 минут для экономии ресурсов\n"
-        "5. Ночью (2:00-8:00 МСК) бот работает в экономном режиме\n\n"
+        "2. *Будни (Пн-Пт):* слоты с 18:30 до 21:00\n"
+        "3. *Выходные:* слоты с 08:30 до 21:30\n"
+        "4. Данные обновляются автоматически\n\n"
         "❓ Есть вопросы? Обращайтесь к разработчику!"
     )
     await update.message.reply_text(text, parse_mode='Markdown')
 
-async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик команды /stats (только для админа)"""
-    user = update.effective_user
-    monitor.log_command('stats', user.id)
-    
-    # Проверка админа (вставьте свой ID Telegram)
-    ADMIN_IDS = [177060946]  # Замените на ваш ID
-    
-    if user.id not in ADMIN_IDS:
-        await update.message.reply_text(
-            "⛔ Эта команда доступна только администратору.",
-            parse_mode='Markdown'
-        )
-        return
-    
-    stats = monitor.get_stats()
-    
-    stats_text = (
-        "📊 *СТАТИСТИКА БОТА*\n\n"
-        f"⏱ *Аптайм:* {stats['uptime_hours']} ч\n"
-        f"👥 *Уникальных пользователей:* {stats['total_users']}\n"
-        f"📨 *Всего команд:* {stats['total_commands']}\n\n"
-        "📈 *По командам:*\n"
-    )
-    
-    for cmd, count in stats['commands_breakdown'].items():
-        stats_text += f"• /{cmd}: {count}\n"
-    
-    stats_text += (
-        f"\n🔄 *Парсинг:*\n"
-        f"• Всего парсингов: {stats['parses']['total']}\n"
-        f"• Попаданий в кэш: {stats['parses']['cache_hits']}\n"
-        f"• Эффективность кэша: {stats['parses']['cache_hit_rate']}\n"
-        f"• Активаций паузы: {stats['pause_activations']}\n\n"
-        f"⚙️ *Настройки:*\n"
-        f"• Кэширование: {Config.CACHE_TTL//60} мин\n"
-        f"• Пауза: {Config.PAUSE_START_HOUR:02d}:00-{Config.PAUSE_END_HOUR:02d}:00 МСК\n"
-        f"• Сейчас пауза: {'ДА' if Config.is_pause_time() else 'нет'}"
-    )
-    
-    await update.message.reply_text(stats_text, parse_mode='Markdown')
-
 async def slots_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик команды /slots — ГЛАВНАЯ ФУНКЦИЯ"""
-    user = update.effective_user
-    monitor.log_command('slots', user.id)
-    
-    # Проверяем режим паузы
-    if Config.is_pause_time():
-        monitor.log_pause_activation()
-        await update.message.reply_text(
-            "😴 *Режим ночной паузы*\n\n"
-            "Сейчас ночное время (2:00-8:00 МСК).\n"
-            "Бот работает в экономном режиме.\n\n"
-            "Данные могут быть не самыми свежими.\n"
-            "⏰ Полное обновление в 8:00 утра!",
-            parse_mode='Markdown'
-        )
-        # В режиме паузы все равно показываем данные, но из кэша
+    # Получаем текущее московское время для отображения
+    current_time_moscow = datetime.now(MOSCOW_TZ)
+    current_time_str = current_time_moscow.strftime("%H:%M")
     
     # Отправляем сообщение о начале поиска
     message = await update.message.reply_text(
-        "🔍 *Ищу свободные слоты...*\n"
-        "_Проверяю доступность на 2 недели вперед. Это займет ~10 секунд ⏳_",
+        f"🔍 *Ищу свободные слоты...*\n"
+        f"_Запрос отправлен в {current_time_str} ⏳_",
         parse_mode='Markdown'
     )
     
     try:
-        # Получаем все слоты (с кэшированием)
+        # Получаем все слоты
         results = parser.get_all_venues_slots()
         
-        # Логируем статистику парсинга
-        if parser._is_cache_valid():
-            monitor.log_parse(cache_hit=True)
-        else:
-            monitor.log_parse(cache_hit=False)
+        # Получаем информацию о кэше
+        cache_info = parser.get_cache_info()
         
         if not results:
             output = "❌ *Не удалось получить данные от сервера FFC.*"
@@ -479,14 +380,27 @@ async def slots_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     "_Попробуйте изменить параметры поиска или проверьте позже._"
                 )
             else:
-                cache_status = "🔄" if parser._is_cache_valid() else "✅"
-                header = f"{cache_status} *СВОБОДНЫЕ СЛОТЫ FFC.TEAM*\n_Найдено {total_slots_found} слотов_\n\n"
+                header = f"⚽ *СВОБОДНЫЕ СЛОТЫ FFC.TEAM*\n_Найдено {total_slots_found} слотов_\n\n"
+                
+                # СОЗДАЕМ КОРРЕКТНОЕ ПРИМЕЧАНИЕ С АКТУАЛЬНЫМ ВРЕМЕНЕМ
+                now_moscow = datetime.now(MOSCOW_TZ)
+                time_str = now_moscow.strftime("%H:%M")
+                date_str = now_moscow.strftime("%d.%m.%Y")
+                
+                # Определяем источник данных
+                if cache_info['is_cached'] and cache_info['is_fresh']:
+                    data_source = "кэшированные данные"
+                else:
+                    data_source = "актуальные данные"
+                
                 footer = (
-                    f"\n📝 _Примечания:_\n"
-                    f"• В будни только слоты с 18:30\n"
-                    f"• Данные обновлены: {datetime.now().strftime('%H:%M')}\n"
-                    f"• Следующее обновление через {max(0, Config.CACHE_TTL - (time.time() - parser._cache['timestamp']))//60:.0f} мин"
+                    f"\n📝 *Примечание:*\n"
+                    f"• Данные актуальны на {time_str} ({date_str})\n"
+                    f"• Будни (Пн-Пт): показываются слоты с 18:30 до 21:00\n"
+                    f"• Выходные: показываются слоты с 08:30 до 21:30\n"
+                    f"• Данные обновляются каждые 5 минут"
                 )
+                
                 output = header + "="*40 + "\n".join(messages) + footer
         
         # Редактируем сообщение с результатами
@@ -510,7 +424,6 @@ async def setup_bot_commands(application):
         ("slots", "Найти свободные слоты ⭐"),
         ("venues", "Список площадок"),
         ("help", "Помощь по использованию"),
-        ("stats", "Статистика (админ)"),
     ])
     logger.info("✅ Меню команд Telegram установлено")
 
@@ -523,15 +436,14 @@ def main():
         return
     
     logger.info("=" * 60)
-    logger.info("🚀 ЗАПУСК БОТА FFC С КЭШИРОВАНИЕМ И АВТО-ПАУЗОЙ")
+    logger.info("🚀 ЗАПУСК БОТА FFC НА RAILWAY")
     logger.info(f"🤖 Токен: {TOKEN[:10]}...{TOKEN[-10:]}")
-    logger.info(f"⚙️ Кэширование: {Config.CACHE_TTL//60} минут")
-    logger.info(f"😴 Авто-пауза: {Config.PAUSE_START_HOUR:02d}:00-{Config.PAUSE_END_HOUR:02d}:00 МСК")
+    logger.info(f"🌐 Часовой пояс: {MOSCOW_TZ}")
     logger.info("=" * 60)
     
     # Создаем приложение с обработкой конфликтов
     async def post_init(app):
-        # Сбрасываем все старые соединения
+        # КРИТИЧЕСКИ ВАЖНО: сбрасываем все старые соединения
         await app.bot.delete_webhook(drop_pending_updates=True)
         await setup_bot_commands(app)
         logger.info("✅ Конфликты сброшены, бот готов к работе")
@@ -548,7 +460,6 @@ def main():
         application.add_handler(CommandHandler("slots", slots_command))
         application.add_handler(CommandHandler("venues", venues_command))
         application.add_handler(CommandHandler("help", help_command))
-        application.add_handler(CommandHandler("stats", stats_command))
         
         # Запускаем бота в режиме постоянного опроса
         logger.info("✅ Бот запущен и ожидает команд...")
@@ -575,10 +486,6 @@ if __name__ == "__main__":
         logger.info("🌐 Среда: Railway (продакшн)")
     else:
         logger.info("💻 Среда: Локальная (разработка)")
-    
-    # Проверяем время паузы при старте
-    if Config.is_pause_time():
-        logger.info(f"😴 Режим авто-паузы активен ({Config.PAUSE_START_HOUR:02d}:00-{Config.PAUSE_END_HOUR:02d}:00 МСК)")
     
     # Запускаем бота
     main()
